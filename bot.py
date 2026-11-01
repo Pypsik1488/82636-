@@ -173,6 +173,19 @@ def set_cfg_param(key: str, value: str):
     conn.close()
 
 
+def normalize_url(url: str) -> str:
+    """Убирает невидимые символы, пробелы, кавычки, лишние '=' и добавляет https://."""
+    url = INVISIBLE_RE.sub("", url or "").strip().strip("<>\"'«»").lstrip("=").strip()
+    url = url.strip("<>\"'«»").strip()
+    if url and not re.match(r"^https?://", url, re.I):
+        url = "https://" + url
+    return url
+
+
+def is_valid_url(url: str) -> bool:
+    return bool(re.match(r"^https?://[^\s/$.?#]+\.[^\s]+$", url, re.I))
+
+
 def get_user(user_id: int):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -241,6 +254,28 @@ class FormState(StatesGroup):
 active_tasks: dict[int, bool] = {}
 
 
+def norm_text(s: str) -> str:
+    """Нормализация для поиска: HTML-сущности, nbsp, невидимые символы, регистр, пробелы."""
+    s = html.unescape(s or "")
+    s = INVISIBLE_RE.sub("", s).replace("\xa0", " ")
+    return re.sub(r"\s+", " ", s).strip().lower()
+
+
+async def get_page_text(page) -> str:
+    """Видимый текст страницы + HTML основной страницы и всех фреймов."""
+    parts = []
+    for frame in page.frames:
+        try:
+            parts.append(await frame.inner_text("body", timeout=1000))
+        except Exception:
+            pass
+        try:
+            parts.append(await frame.content())
+        except Exception:
+            pass
+    return norm_text(" ".join(parts))
+
+
 def set_task_status(task_id: int, status: str):
     conn = sqlite3.connect(DB_PATH)
     conn.execute("UPDATE queue SET status = ?, attempts = attempts + 1 WHERE id = ?", (status, task_id))
@@ -252,9 +287,13 @@ async def process_report_task(task_id: int, problem: str, name: str, email: str,
     """Возвращает (успех: bool, текст_ошибки: str | None). Не выбрасывает исключений."""
     try:
         cfg = get_cfg()
-        target_url = cfg.get("target_url", "").strip()
+        target_url = normalize_url(cfg.get("target_url", ""))
         if not target_url:
             raise RuntimeError("target_url не задан! Задайте URL через /set target_url <URL>")
+        if not is_valid_url(target_url):
+            raise RuntimeError(
+                f"target_url некорректный: {target_url!r}. Пример: /set target_url https://example.com/contact"
+            )
 
         nav_timeout = int(cfg.get("nav_timeout", 45)) * 1000
         headless_mode = cfg.get("headless", "True").strip().lower() == "true"
@@ -291,32 +330,44 @@ async def process_report_task(task_id: int, problem: str, name: str, email: str,
                 await submit_btn.click(force=True, timeout=nav_timeout)
 
                 # 4. Проверка успешности отправки
-                success_timeout = int(cfg.get("success_timeout", 15))
-                await asyncio.sleep(3)
-                content = (await page.content()).lower()
+                success_timeout = max(int(cfg.get("success_timeout", 15)), 5)
+                sel_success = cfg.get("sel_success", "").strip()
+                success_keywords = [
+                    norm_text(k) for k in cfg["success_text"].split(",") if k.strip()
+                ]
 
                 is_success = False
-                sel_success = cfg.get("sel_success", "").strip()
-                if sel_success:
-                    try:
-                        await page.locator(sel_success).first.wait_for(
-                            state="visible", timeout=success_timeout * 1000
-                        )
+                content = ""
+                loop = asyncio.get_running_loop()
+                deadline = loop.time() + success_timeout
+                while True:
+                    content = await get_page_text(page)
+                    if any(kw in content for kw in success_keywords):
                         is_success = True
-                    except Exception:
-                        is_success = False
-                if not is_success:
-                    success_keywords = [k.strip().lower() for k in cfg["success_text"].split(",") if k.strip()]
-                    is_success = any(kw in content for kw in success_keywords)
+                        break
+                    if sel_success:
+                        try:
+                            if await page.locator(sel_success).first.is_visible():
+                                is_success = True
+                                break
+                        except Exception:
+                            pass
+                    if loop.time() >= deadline:
+                        break
+                    await asyncio.sleep(0.5)
 
                 if is_success:
                     set_task_status(task_id, "success")
                     return True, None
 
-                captcha_keywords = [k.strip().lower() for k in cfg["captcha_text"].split(",") if k.strip()]
+                captcha_keywords = [norm_text(k) for k in cfg["captcha_text"].split(",") if k.strip()]
                 if any(ck in content for ck in captcha_keywords):
                     raise RuntimeError("Обнаружена защитная CAPTCHA / Cloudflare Turnstile")
-                raise RuntimeError("Форма отправлена, но подтверждение успеха не найдено.")
+                snippet = content[:200].replace("\n", " ")
+                raise RuntimeError(
+                    "Форма отправлена, но подтверждение успеха не найдено. "
+                    f"Искали: {success_keywords}. Текст страницы: {snippet!r}"
+                )
             finally:
                 # закрываем браузер до выхода из async_playwright()
                 await browser.close()
@@ -572,6 +623,15 @@ async def admin_set(msg: Message):
 
     key = INVISIBLE_RE.sub("", parts[1]).strip()
     val = INVISIBLE_RE.sub("", parts[2]).strip()
+
+    if key == "target_url":
+        val = normalize_url(val)
+        if not is_valid_url(val):
+            await msg.answer(
+                "❌ Это не похоже на ссылку. Пример:\n"
+                "<code>/set target_url https://example.com/contact</code>"
+            )
+            return
 
     set_cfg_param(key, val)
     await msg.answer(
