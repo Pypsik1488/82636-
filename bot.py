@@ -1,11 +1,45 @@
 import asyncio
 import html
+import importlib.util
 import logging
+import os
 import re
 import sqlite3
+import subprocess
+import sys
 from datetime import datetime, timedelta
 
-from aiogram import Bot, Dispatcher, F, Router
+
+# ==========================================
+# АВТОУСТАНОВКА ЗАВИСИМОСТЕЙ (всё в одном файле)
+# ==========================================
+def _run(cmd: list) -> bool:
+    return subprocess.run(cmd).returncode == 0
+
+
+def bootstrap():
+    """Ставит aiogram, playwright и браузер Chromium, если их ещё нет."""
+    packages = {"aiogram": "aiogram>=3.7", "playwright": "playwright"}
+    missing = [pkg for mod, pkg in packages.items() if importlib.util.find_spec(mod) is None]
+    if missing:
+        print(f"Устанавливаю: {', '.join(missing)} ...", flush=True)
+        base = [sys.executable, "-m", "pip", "install", "-q"]
+        if not _run(base + missing):
+            _run(base + ["--break-system-packages"] + missing)
+
+    marker = ".chromium_installed"
+    if not os.path.exists(marker):
+        print("Устанавливаю браузер Chromium (один раз, может занять пару минут) ...", flush=True)
+        ok = _run([sys.executable, "-m", "playwright", "install", "--with-deps", "chromium"])
+        if not ok:
+            ok = _run([sys.executable, "-m", "playwright", "install", "chromium"])
+        if ok:
+            open(marker, "w").close()
+
+
+bootstrap()
+
+from aiogram import Bot, Dispatcher, F, Router  # noqa: E402
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
@@ -216,7 +250,6 @@ def set_task_status(task_id: int, status: str):
 
 async def process_report_task(task_id: int, problem: str, name: str, email: str, phone: str):
     """Возвращает (успех: bool, текст_ошибки: str | None). Не выбрасывает исключений."""
-    browser = None
     try:
         cfg = get_cfg()
         target_url = cfg.get("target_url", "").strip()
@@ -231,69 +264,67 @@ async def process_report_task(task_id: int, problem: str, name: str, email: str,
                 headless=headless_mode,
                 args=["--no-sandbox", "--disable-setuid-sandbox"],
             )
-            context = await browser.new_context(user_agent=cfg.get("user_agent"))
-            page = await context.new_page()
-            page.set_default_timeout(nav_timeout)
-
-            # 1. Переход на страницу
-            await page.goto(target_url, wait_until="domcontentloaded")
             try:
-                await page.wait_for_load_state("networkidle", timeout=10000)
-            except Exception:
-                pass  # сайт может бесконечно что-то подгружать — это не ошибка
+                context = await browser.new_context(user_agent=cfg.get("user_agent"))
+                page = await context.new_page()
+                page.set_default_timeout(nav_timeout)
 
-            # 2. Заполнение полей (селекторы с запятой матчат несколько элементов -> берём первый)
-            await page.locator(cfg["sel_problem"]).first.fill(problem)
-            await page.locator(cfg["sel_email"]).first.fill(email)
-            await page.locator(cfg["sel_phone"]).first.fill(phone)
-            if cfg.get("sel_name"):
+                # 1. Переход на страницу
+                await page.goto(target_url, wait_until="domcontentloaded")
                 try:
-                    await page.locator(cfg["sel_name"]).first.fill(name, timeout=3000)
+                    await page.wait_for_load_state("networkidle", timeout=10000)
                 except Exception:
-                    pass
+                    pass  # сайт может бесконечно что-то подгружать — это не ошибка
 
-            # 3. Клик по кнопке отправки
-            submit_btn = page.locator(cfg["sel_submit"]).first
-            await submit_btn.click(force=True, timeout=nav_timeout)
+                # 2. Заполнение полей (селекторы с запятой матчат несколько элементов -> берём первый)
+                await page.locator(cfg["sel_problem"]).first.fill(problem)
+                await page.locator(cfg["sel_email"]).first.fill(email)
+                await page.locator(cfg["sel_phone"]).first.fill(phone)
+                if cfg.get("sel_name"):
+                    try:
+                        await page.locator(cfg["sel_name"]).first.fill(name, timeout=3000)
+                    except Exception:
+                        pass
 
-            # 4. Проверка успешности отправки
-            success_timeout = int(cfg.get("success_timeout", 15))
-            await asyncio.sleep(3)
-            content = (await page.content()).lower()
+                # 3. Клик по кнопке отправки
+                submit_btn = page.locator(cfg["sel_submit"]).first
+                await submit_btn.click(force=True, timeout=nav_timeout)
 
-            is_success = False
-            sel_success = cfg.get("sel_success", "").strip()
-            if sel_success:
-                try:
-                    await page.locator(sel_success).first.wait_for(
-                        state="visible", timeout=success_timeout * 1000
-                    )
-                    is_success = True
-                except Exception:
-                    is_success = False
-            if not is_success:
-                success_keywords = [k.strip().lower() for k in cfg["success_text"].split(",") if k.strip()]
-                is_success = any(kw in content for kw in success_keywords)
+                # 4. Проверка успешности отправки
+                success_timeout = int(cfg.get("success_timeout", 15))
+                await asyncio.sleep(3)
+                content = (await page.content()).lower()
 
-            if is_success:
-                set_task_status(task_id, "success")
-                return True, None
+                is_success = False
+                sel_success = cfg.get("sel_success", "").strip()
+                if sel_success:
+                    try:
+                        await page.locator(sel_success).first.wait_for(
+                            state="visible", timeout=success_timeout * 1000
+                        )
+                        is_success = True
+                    except Exception:
+                        is_success = False
+                if not is_success:
+                    success_keywords = [k.strip().lower() for k in cfg["success_text"].split(",") if k.strip()]
+                    is_success = any(kw in content for kw in success_keywords)
 
-            captcha_keywords = [k.strip().lower() for k in cfg["captcha_text"].split(",") if k.strip()]
-            if any(ck in content for ck in captcha_keywords):
-                raise RuntimeError("Обнаружена защитная CAPTCHA / Cloudflare Turnstile")
-            raise RuntimeError("Форма отправлена, но подтверждение успеха не найдено.")
+                if is_success:
+                    set_task_status(task_id, "success")
+                    return True, None
+
+                captcha_keywords = [k.strip().lower() for k in cfg["captcha_text"].split(",") if k.strip()]
+                if any(ck in content for ck in captcha_keywords):
+                    raise RuntimeError("Обнаружена защитная CAPTCHA / Cloudflare Turnstile")
+                raise RuntimeError("Форма отправлена, но подтверждение успеха не найдено.")
+            finally:
+                # закрываем браузер до выхода из async_playwright()
+                await browser.close()
 
     except Exception as e:
         logger.exception("Ошибка в задаче #%s", task_id)
         set_task_status(task_id, "failed")
         return False, str(e)
-    finally:
-        if browser is not None:
-            try:
-                await browser.close()
-            except Exception:
-                pass
 
 
 async def batch_worker(user_id: int, bot: Bot, first_id: int, last_id: int):
